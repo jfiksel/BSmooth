@@ -1,5 +1,6 @@
-BSmooth.fstat <- function(BSseq, designMat, contrasts,
-                          local.correct = TRUE, maxGap = NULL, qSd = 0.75, k = 101, mc.cores = 1, verbose = TRUE){
+BSmooth.fstat <- function(BSseq, groups, designMat, contrasts,
+                          weights = NULL, maxGap = NULL, qSd = 0.75,
+                          k = 101, mc.cores = 1, verbose = TRUE){
   smoothSd <- function(Sds, k) {
     k0 <- floor(k/2)
     if(all(is.na(Sds))) return(Sds)
@@ -27,33 +28,40 @@ BSmooth.fstat <- function(BSseq, designMat, contrasts,
   
   stopifnot(is(BSseq, "BSseq"))
   stopifnot(hasBeenSmoothed(BSseq))
-  if(any(attributes(design)$assign == 0)){
-    stop("Change design matrix to group means design")
-  }
-#   if(is.character(group1)) {
-#     stopifnot(all(group1 %in% sampleNames(BSseq)))
-#     group1 <- match(group1, sampleNames(BSseq))
-#   }
-#   if(is.numeric(group1)) {
-#     stopifnot(min(group1) >= 1 & max(group1) <= ncol(BSseq))
-#   } else stop("problems with argument 'group1'")
-#   if(is.character(group2)) {
-#     stopifnot(all(group2 %in% sampleNames(BSseq)))
-#     group2 <- match(group2, sampleNames(BSseq))
-#   }    
-#   if(is.numeric(group2)) {
-#     stopifnot(min(group2) >= 1 & max(group2) <= ncol(BSseq))
-#   } else stop("problems with argument 'group2'")
-#   stopifnot(length(intersect(group1, group2)) == 0)
-#   stopifnot(length(group1) > 0)
-#   stopifnot(length(group2) > 0)
-#   stopifnot(length(group1) + length(group2) >= 3)
-#   if(estimate.var == "paired")
-#     stopifnot(length(group1) == length(group2))
   
-#   if(any(rowSums(getCoverage(BSseq)[, c(group1, group2)]) == 0))
-#     warning("Computing t-statistics at locations where there is no data; consider subsetting the 'BSseq' object first")
-
+  for(i in 1:length(groups)){
+    if(is.character(groups[[i]])){
+      stopifnot(all(groups[[i]] %in% sampleNames(BSseq)))
+      groups[[i]] <- match(groups[[i]], sampleNames(BSseq))
+    }
+    if(is.numeric(groups[[i]])){
+      group <- groups[[i]]
+      stopifnot(min(group) >=1 & max(group) <= ncol(BSseq))
+    }
+    else{
+      stop(paste("Problems with argument group", i))
+    }
+    
+  }
+  
+  for(i in 1: (length(groups) - 1)){
+    for(j in (i + 1):length(groups)){
+      stopifnot(length(intersect(groups[[i]], groups[[j]])) == 0)
+    }
+  }
+  
+  for(i in 1:length(groups)){
+    stopifnot(length(groups[[i]]) > 0)
+  }
+  
+  n_i <- unlist((lapply(groups, function(x) length(x))))
+  N <- sum(n_i)
+  stopifnot(N >= length(groups) + 1)
+  
+  
+  if(any(rowSums(getCoverage(BSseq)[, unlist(groups)]) == 0))
+    warning("Computing t-statistics at locations where there is no data; consider subsetting the 'BSseq' object first")
+  
   if(is.null(maxGap))
     maxGap <- BSseq@parameters$maxGap
   if(is.null(maxGap))
@@ -70,17 +78,18 @@ BSmooth.fstat <- function(BSseq, designMat, contrasts,
   ptime1 <- proc.time()
   allPs <- getMeth(BSseq, type = "smooth", what = "perBase",
                    confint = FALSE)
-  fit <- lmFit(allPs, design)
-  coef <- fit$coef
-  n_i <- colSums(design)
-  N <- sum(n_i)
+  
+  meanMat <- do.call(cbind, lapply(groups, function(g) {
+    rowMeans(allPs[, g])
+  }))
+  
   getSS_b <- function(groupMeans){
-    GM <- sum(n_i * groupMeans)/N
+    GM <- sum(n_i * groupMeans) / N
     SS_b <- sum(n_i * (groupMeans - GM) ^ 2)
     SS_b
   }
-  SS_b <- apply(coef, 1, getSS_b)
-  MS_b <- SS_b/(ncol(design) - 1)
+  SS_b <- apply(meanMat, 1, getSS_b)
+  MS_b <- SS_b/(length(groups) - 1)
   ptime2 <- proc.time()
   stime <- (ptime2 - ptime1)[3]
   if(verbose) cat(sprintf("done in %.1f sec\n", stime))
@@ -88,72 +97,35 @@ BSmooth.fstat <- function(BSseq, designMat, contrasts,
   if(verbose) cat("[BSmooth.fstat] computing variation within groups ... ")
   ptime1 <- proc.time()
   contrast.matrix <- makeContrasts(contrasts = contrasts, levels = design)
+  fit <- lmFit(allPs, design, weights = weights)
   fit2 <- contrasts.fit(fit, contrast.matrix)
   fit2 <- eBayes(fit2, trend = T)
-  eBayesSds <- fit2$s2.post
+  
+  rawSds <- fit2$sigma
   smoothSds <- do.call(c, mclapply(clusterIdx, function(idx) {
-     smoothSd(eBayesSds[idx], k = k)
+    smoothSd(rawSds[idx], k = k)
   }, mc.cores = mc.cores))
-  SS_w <- smoothSds * fit2$df.total
-  MS_w <- smoothSds
+  MS_w <- smoothSds^2
   fstat <- MS_b/MS_w
-#   switch(estimate.var,
-#          "group2" = {
-#            rawSds <- rowSds(allPs[, group2, drop = FALSE], na.rm = TRUE)
-#            smoothSds <- do.call(c, mclapply(clusterIdx, function(idx) {
-#              smoothSd(rawSds[idx], k = k)
-#            }, mc.cores = mc.cores))
-#            scale <- sqrt(1/length(group1) + 1/length(group2))
-#            tstat.sd <- smoothSds * scale
-#          },
-#          "same" = {
-#            rawSds <- sqrt( ((length(group1) - 1) * rowVars(allPs[, group1, drop = FALSE]) +
-#                               (length(group2) - 1) * rowVars(allPs[, group2, drop = FALSE])) /
-#                              (length(group1) + length(group2) - 2))
-#            smoothSds <- do.call(c, mclapply(clusterIdx, function(idx) {
-#              smoothSd(rawSds[idx], k = k)
-#            }, mc.cores = mc.cores))
-#            scale <- sqrt(1/length(group1) + 1/length(group2))
-#            tstat.sd <- smoothSds * scale
-#          },
-#          "paired" = {
-#            rawSds <- rowSds(allPs[, group1, drop = FALSE] - allPs[, group2, drop = FALSE])
-#            smoothSds <- do.call(c, mclapply(clusterIdx, function(idx) {
-#              smoothSd(rawSds[idx], k = k)
-#            }, mc.cores = mc.cores))
-#            scale <- sqrt(1/length(group1))
-#            tstat.sd <- smoothSds * scale
-#          })
-#   fstat <- (group1.means - group2.means) / tstat.sd
+  
   is.na(fstat)[MS_w == 0] <- TRUE
-  if(local.correct) {
-    fstat.corrected <- do.call(c, mclapply(clusterIdx,
-                                           compute.correction, qSd = qSd,
-                                           mc.cores = mc.cores))
-  }
+  
   ptime2 <- proc.time()
   stime <- (ptime2 - ptime1)[3]
   if(verbose) cat(sprintf("done in %.1f sec\n", stime))
   
-  if(local.correct) {
-    stats <- cbind(SS_b, MS_b, eBayesSds, SS_w, MS_w,
-                   fstat, fstat.corrected)
-    colnames(stats) <- c("SS.between", "MS.between",
-                         "eBayes.sd", "Smoothed.SS", "Smoothed.MSS", "fstat",
-                         "fstat.corrected")
-    
-  } else {
-    stats <- cbind(SS_b, MS_b, eBayesSds, SS_w, MS_w,
-                   fstat)
-    colnames(stats) <- c("SS.between", "MS.between",
-                         "eBayes.sd", "Smoothed.SS", "Smoothed.MSS", "fstat")
-  }
+  
+  stats <- cbind(SS_b, MS_b, rawSds, MS_w,
+                 fstat)
+  colnames(stats) <- c("SS.between", "MS.between",
+                       "Raw.SS", "Smoothed.MS", "fstat")
+  
   
   parameters <- c(BSseq@parameters,
-                  list(fstatText = sprintf("BSmooth.fstat (local.correct = %s, maxGap = %d)",
-                                           local.correct, maxGap),
-                        k = k, qSd = qSd,
-                       local.correct = local.correct, maxGap = maxGap))
+                  list(fstatText = sprintf("BSmooth.fstat (maxGap = %d)",
+                                           maxGap),
+                       k = k, qSd = qSd,
+                       maxGap = maxGap))
   out <- BSseqFstat(gr = granges(BSseq), stats = stats, parameters = parameters)
   out
 }
