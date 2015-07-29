@@ -1,0 +1,126 @@
+setClass("BSseqFstat", contains = "hasGRanges", 
+         representation(stats = "matrix",
+                        parameters = "list")
+)
+setValidity("BSseqFstat", function(object) {
+  msg <- NULL
+  if(length(object@gr) != nrow(object@stats))
+    msg <- c(msg, "length of 'gr' is different from the number of rows of 'stats'")
+  if(is.null(msg)) TRUE else msg
+})
+
+setMethod("show", signature(object = "BSseqFstat"),
+          function(object) {
+            cat("An object of type 'BSseqFstat' with\n")
+            cat(" ", length(object), "methylation loci\n")
+            cat("based on smoothed data:\n")
+            cat(" ", object@parameters$smoothText, "\n")
+            cat("with parameters\n")
+            cat(" ", object@parameters$FstatText, "\n")
+          })
+
+setMethod("[", "BSseqFstat", function(x, i, ...) {
+  if(missing(i))
+    stop("need [i] for subsetting")
+  if(missing(i))
+    return(x)
+  x@gr <- x@gr[i]
+  x@stats <- x@stats[i,, drop = FALSE]
+  x
+})
+
+BSseqFstat <- function(gr = NULL, stats = NULL, parameters = NULL) {
+  out <- new("BSseqFstat")
+  out@gr <- gr
+  out@stats <- stats
+  out@parameters <- parameters
+  out
+}
+
+summary.BSseqFstat <- function(object, ...) {
+  quant <- quantile(geFstats(object)[, "Fstat.corrected"],
+                    prob = c(0.0001, 0.001, 0.01, 0.5, 0.99, 0.999, 0.9999))
+  quant <- t(t(quant))
+  colnames(quant) <- "quantiles"
+  out <- list(quantiles = quant)
+  class(out) <- "summary.BSseqFstat"
+  out
+}
+
+print.summary.BSseqFstat <- function(x, ...) {
+  print(as.matrix(x$quantiles))
+}
+
+plot.BSseqFstat <- function(x, y, ...) {
+  Fstat <- geFstats(x)[, "Fstat"]
+  plot(density(Fstat), xlim = c(-10,10), col = "blue", main = "")
+  if("Fstat.corrected" %in% colnames(geFstats(x))) {
+    Fstat.cor <- geFstats(x)[, "Fstat.corrected"]
+    lines(density(Fstat.cor), col = "black")
+    legend("topleft", legend = c("uncorrected", "corrected"), lty = c(1,1),
+           col = c("blue", "black"))
+  } else {
+    legend("topleft", legend = c("uncorrected"), lty = 1,
+           col = c("blue"))
+  }
+}
+
+geFstats <- function(BSseqFstat, regions = NULL, stat = "Fstat.corrected") {
+  stopifnot(is(BSseqFstat, "BSseqFstat"))
+  if(is.null(regions))
+    return(BSseqFstat@stats)
+  if(class(regions) == "data.frame")
+    regions <- data.frame2GRanges(regions)
+  stopifnot(stat %in% colnames(BSseqFstat@stats))
+  stopifnot(length(stat) == 1)
+  stopifnot(is(regions, "GenomicRanges"))
+  ov <- findOverlaps(BSseqFstat, regions)
+  ov.sp <- split(queryHits(ov), subjectHits(ov))
+  getRegionStats <- function(idx) {
+    mat <- BSseqFstat@stats[idx,, drop=FALSE]
+    areaStat <- sum(mat[, stat])
+    maxStat <- max(mat[, stat])
+    c(areaStat, maxStat)
+  }
+  stats <- matrix(NA, ncol = 2, nrow = length(regions))
+  colnames(stats) <- c("areaStat", "maxStat")
+  tmp <- lapply(ov.sp, getRegionStats)
+  stats[as.integer(names(tmp)),] <- do.call(rbind, tmp)
+  out <- as.data.frame(stats)
+  if(! stat %in% c("Fstat.corrected", "Fstat"))
+    return(out)
+  getRegionStats_ttest <- function(idx) {
+    mat <- BSseqFstat@stats[idx,, drop=FALSE]
+    group1.mean <- mean(mat[, "group1.means"])
+    group2.mean <- mean(mat[, "group2.means"])
+    meanDiff <- mean(mat[, "group1.means"] - mat[, "group2.means"])
+    Fstat.sd <- mean(mat[, "Fstat.sd"])
+    c(meanDiff, group1.mean, group2.mean, Fstat.sd)
+  }
+  stats_ttest<- matrix(NA, ncol = 4, nrow = length(regions))
+  colnames(stats_ttest) <- c("meanDiff", "group1.mean", "group2.mean", "Fstat.sd")
+  tmp <- lapply(ov.sp, getRegionStats_ttest)
+  stats_ttest[as.integer(names(tmp)),] <- do.call(rbind, tmp)
+  out <- cbind(out, as.data.frame(stats_ttest))
+  out
+}
+
+makeClusters <- function(hasGRanges, maxGap = 10^8) {
+  chrOrder <- as.character(runValue(seqnames(hasGRanges)))
+  if(anyDuplicated(chrOrder))
+    stop("argument 'hasGRanges' is not properly order")
+  grBase <- granges(hasGRanges)
+  clusters <- reduce(resize(grBase, width = 2*maxGap + 1, fix = "center"))
+  start(clusters) <- pmax(rep(1, length(clusters)), start(clusters))
+  clusters.sp <- split(clusters, seqnames(clusters))
+  stopifnot(all(sapply(clusters.sp, function(cluster.gr) {
+    if(length(cluster.gr) <= 1) return(TRUE)
+    all(start(cluster.gr)[-length(cluster.gr)] < end(cluster.gr)[-1])
+  }))) # are the clusters ordered within the chromosome? This is probably guranteed
+  clusters <- Reduce(c, clusters.sp[chrOrder])
+  stopifnot(all(chrOrder == runValue(seqnames(clusters))))
+  ov <- findOverlaps(grBase, clusters)
+  clusterIdx <- split(as.matrix(ov)[,1], as.matrix(ov)[,2])
+  names(clusterIdx) <- NULL
+  clusterIdx
+}
