@@ -9,22 +9,6 @@ BSmooth.fstat <- function(BSseq, groups, designMat, contrasts,
     sSds <- as.vector(runmean(Rle(c(addSD, thresSD, addSD)), k = k))
     sSds
   }
-  compute.correction <- function(idx, qSd = 0.75) {
-    xx <- start(BSseq)[idx]
-    yy <- fstat[idx]
-    suppressWarnings({
-      drange <- diff(range(xx, na.rm = TRUE))
-    })
-    if(drange <= 25000)
-      return(yy)
-    fstat.function <- approxfun(xx, yy)
-    xx.reg <- seq(from = min(xx), to = max(xx), by = 2000)
-    yy.reg <- tstat.function(xx.reg)
-    fit <- locfit(yy.reg ~ lp(xx.reg, h = 25000, deg = 2, nn = 0),
-                  family = "huber", maxk = 50000) 
-    correction <- predict(fit, newdata = data.frame(xx.reg = xx))
-    yy - correction 
-  }
   
   stopifnot(is(BSseq, "BSseq"))
   stopifnot(hasBeenSmoothed(BSseq))
@@ -79,30 +63,33 @@ BSmooth.fstat <- function(BSseq, groups, designMat, contrasts,
   allPs <- getMeth(BSseq, type = "smooth", what = "perBase",
                    confint = FALSE)
   
-  meanMat <- do.call(cbind, lapply(groups, function(g) {
-    rowMeans(allPs[, g])
-  }))
+  contrast.matrix <- makeContrasts(contrasts = contrasts, levels = design)
+  fit <- lmFit(allPs, design, weights = weights)
+  fit2 <- contrasts.fit(fit, contrast.matrix)
+  fit2 <- eBayes(fit2, trend = T)
+  MS_b <- fit2$F * fit2$s2.post
+  SS_b <- MS_b * (length(groups) - 1)
   
-  getSS_b <- function(groupMeans){
-    GM <- sum(n_i * groupMeans) / N
-    SS_b <- sum(n_i * (groupMeans - GM) ^ 2)
-    SS_b
-  }
-  SS_b <- apply(meanMat, 1, getSS_b)
-  MS_b <- SS_b/(length(groups) - 1)
+  #   meanMat <- do.call(cbind, lapply(groups, function(g) {
+  #     rowMeans(allPs[, g])
+  #   }))
+  #   
+  #   getSS_b <- function(groupMeans){
+  #     GM <- sum(n_i * groupMeans) / N
+  #     SS_b <- sum(n_i * (groupMeans - GM) ^ 2)
+  #     SS_b
+  #   }
+  #   SS_b <- apply(meanMat, 1, getSS_b)
+  #   MS_b <- SS_b/(length(groups) - 1)
   ptime2 <- proc.time()
   stime <- (ptime2 - ptime1)[3]
   if(verbose) cat(sprintf("done in %.1f sec\n", stime))
   
   if(verbose) cat("[BSmooth.fstat] computing variation within groups ... ")
   ptime1 <- proc.time()
-  contrast.matrix <- makeContrasts(contrasts = contrasts, levels = design)
-  fit <- lmFit(allPs, design, weights = weights)
-  fit2 <- contrasts.fit(fit, contrast.matrix)
-  fit2 <- eBayes(fit2, trend = T)
   
   rawSds <- fit2$sigma
-  smoothSds <- do.call(c, mclapply(clusterIdx, function(idx) {
+  smoothSds <- do.call("c", mclapply(clusterIdx, function(idx) {
     smoothSd(rawSds[idx], k = k)
   }, mc.cores = mc.cores))
   MS_w <- smoothSds^2
@@ -129,3 +116,4 @@ BSmooth.fstat <- function(BSseq, groups, designMat, contrasts,
   out <- BSseqFstat(gr = granges(BSseq), stats = stats, parameters = parameters)
   out
 }
+
