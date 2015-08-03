@@ -1,0 +1,109 @@
+BSmooth.fstat <- function(BSseq, groups, designMat, contrasts,
+                          weights = NULL, maxGap = NULL, qSd = 0.75,
+                          k = 101, mc.cores = 1, verbose = TRUE){
+  smoothSd <- function(Sds, k) {
+    k0 <- floor(k/2)
+    if(all(is.na(Sds))) return(Sds)
+    thresSD <- pmax(Sds, quantile(Sds, qSd, na.rm = TRUE), na.rm = TRUE)
+    addSD <- rep(median(Sds, na.rm = TRUE), k0)
+    sSds <- as.vector(runmean(Rle(c(addSD, thresSD, addSD)), k = k))
+    sSds
+  }
+  
+  stopifnot(is(BSseq, "BSseq"))
+  stopifnot(hasBeenSmoothed(BSseq))
+  
+  for(i in 1:length(groups)){
+    if(is.character(groups[[i]])){
+      stopifnot(all(groups[[i]] %in% sampleNames(BSseq)))
+      groups[[i]] <- match(groups[[i]], sampleNames(BSseq))
+    }
+    if(is.numeric(groups[[i]])){
+      group <- groups[[i]]
+      stopifnot(min(group) >=1 & max(group) <= ncol(BSseq))
+    }
+    else{
+      stop(paste("Problems with argument group", i))
+    }
+    
+  }
+  
+  for(i in 1: (length(groups) - 1)){
+    for(j in (i + 1):length(groups)){
+      stopifnot(length(intersect(groups[[i]], groups[[j]])) == 0)
+    }
+  }
+  
+  for(i in 1:length(groups)){
+    stopifnot(length(groups[[i]]) > 0)
+  }
+  
+  n_i <- unlist((lapply(groups, function(x) length(x))))
+  N <- sum(n_i)
+  stopifnot(N >= length(groups) + 1)
+  
+  
+  if(any(rowSums(getCoverage(BSseq)[, unlist(groups)]) == 0))
+    warning("Computing t-statistics at locations where there is no data; consider subsetting the 'BSseq' object first")
+  
+  if(is.null(maxGap))
+    maxGap <- BSseq@parameters$maxGap
+  if(is.null(maxGap))
+    stop("need to set argument 'maxGap'")
+  
+  if(verbose) cat("[BSmooth.fstat] preprocessing ... ")
+  ptime1 <- proc.time()
+  clusterIdx <- makeClusters(BSseq, maxGap = maxGap)
+  ptime2 <- proc.time()
+  stime <- (ptime2 - ptime1)[3]
+  if(verbose) cat(sprintf("done in %.1f sec\n", stime))
+  
+  if(verbose) cat("[BSmooth.fstat] computing t-statistics ... ")
+  ptime1 <- proc.time()
+  allPs <- getMeth(BSseq, type = "smooth", what = "perBase",
+                   confint = FALSE)
+  contrast.matrix <- makeContrasts(contrasts = contrasts, levels = design)
+  fit <- lmFit(allPs, design, weights = weights)
+  fit2 <- contrasts.fit(fit, contrast.matrix)
+  
+  coef <- fit2$coef
+  stdev.unscaled <- fit2$stdev.unscaled
+  rawSds <- fit2$sigma
+  
+  smoothSds <- do.call("c", mclapply(clusterIdx, function(idx) {
+    smoothSd(rawSds[idx], k = k)
+  }, mc.cores = mc.cores))
+  
+  tstat.sd <- stdev.unscaled * smoothSds
+  tstats <- coef / tstat.sd
+  
+  ptime2 <- proc.time()
+  stime <- (ptime2 - ptime1)[3]
+  if(verbose) cat(sprintf("done in %.1f sec\n", stime))
+  
+  if(verbose) cat("[BSmooth.fstat] computing F-statistics ... ")
+  ptime1 <- proc.time()
+  
+  fstat <- classifyTestsF(tstats, fstat.only = T)
+  
+  is.na(fstat)[tstat.sd == 0] <- TRUE
+  
+  ptime2 <- proc.time()
+  stime <- (ptime2 - ptime1)[3]
+  if(verbose) cat(sprintf("done in %.1f sec\n", stime))
+  
+  
+  stats <- cbind(rawSds, smoothSds,
+                 fstat)
+  colnames(stats) <- c("rawSds", "smoothSds",
+                        "fstat")
+  
+  parameters <- c(BSseq@parameters,
+                  list(fstatText = sprintf("BSmooth.fstat (maxGap = %d)",
+                                           maxGap),
+                       k = k, qSd = qSd,
+                       maxGap = maxGap))
+  out <- BSseqFstat(gr = granges(BSseq), stats = stats, parameters = parameters)
+  out
+}
+
